@@ -45,3 +45,10 @@ generation_config:
   - `pinned_catalogs`: List of target catalogs to synchronize
 - `generation_config`:
   - `max_staleness_duration_hours`: Maximum allowed time difference between source and target catalogs (in hours)
+
+## Roadmap
+
+- [ ] Tidy up codebase
+- [ ] Add support for executing generated queries
+- [ ] Add detection of recent table updates by other users
+- [ ] Support configuration options in table properties
