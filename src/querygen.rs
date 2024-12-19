@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use crate::schema::SyncEntry;
-use crate::unitycatalog::{Catalog, Table, UnityCatalog};
+use crate::unitycatalog::{Catalog, Schema, Table, UnityCatalog};
 use chrono::TimeDelta;
 use log::{info, warn};
 use serde::{self, Deserialize, Deserializer};
@@ -16,71 +18,84 @@ where
 pub struct QueryGen {
     #[serde(deserialize_with = "hour_to_duration")]
     max_staleness_duration_hours: TimeDelta,
+    deep_clone_non_managed: bool,
+    create_schema_if_missing: bool,
 }
 
 impl QueryGen {
-    fn generate_query_from_table_comparison(
-        &self,
-        parent: &Table,
-        child: &Catalog,
-    ) -> Option<String> {
-        if parent.table_type != "MANAGED" {
-            warn!("Table {} is not MANAGED (type={}). Only managed tables support SHALLOW CLONE. Skipping...",
-            parent.to_path(), parent.table_type);
-            return None;
+    fn generate_query_from_table_comparison(&self, parent: &Table, child: &Catalog) -> Vec<String> {
+        let mut queries = Vec::<String>::new();
+
+        if !child.schemas.contains_key(&parent.schema_name) {
+            if self.create_schema_if_missing {
+                queries.push(format!(
+                    "CREATE SCHEMA {}.{};",
+                    child.name, parent.schema_name
+                ));
+            } else {
+                warn!(
+                    "Schema {}.{} does not exist in child catalog. Skipping...",
+                    child.name, parent.schema_name
+                );
+                return queries;
+            }
         }
-        if parent
-            .data_source_format
-            .as_ref()
-            .is_none_or(|f| f != "DELTA")
-        {
-            warn!("Table {} is not of data source format DELTA (format={}). Only DELTA tables support SHALLOW CLONE. Skipping...",
-            parent.to_path(), parent.data_source_format.as_ref().unwrap_or(&String::from("N/A")));
-            return None;
+        let binding = Schema {
+            _name: parent.schema_name.to_string(),
+            tables: HashMap::new(),
+        };
+        let schema = child.schemas.get(&parent.schema_name).unwrap_or(&binding);
+
+        let mut clone_type: String = "SHALLOW".to_string();
+        match parent {
+            &Table { ref table_type, .. }
+                if table_type != "MANAGED" && self.deep_clone_non_managed =>
+            {
+                clone_type = String::from("DEEP")
+            }
+            &Table {
+                ref data_source_format,
+                ..
+            } if data_source_format.as_ref().is_none_or(|f| f != "DELTA")
+                && self.deep_clone_non_managed =>
+            {
+                clone_type = String::from("DEEP")
+            }
+            _ => {}
         }
 
-        let schema = child.schemas.get(&parent.schema_name);
-        match schema {
-            Some(schema) => {
-                let table = schema.tables.get(&parent.name);
-                match table {
-                    Some(table) => {
-                        if parent.updated_at - table.updated_at > self.max_staleness_duration_hours
-                        {
-                            info!("Table {} is stale. Recreating...", table.to_path());
-                            return Some(format!(
-                                "CREATE OR REPLACE TABLE {} SHALLOW CLONE {};",
-                                table.to_path(),
-                                parent.to_path()
-                            ));
-                        }
-                        return None;
-                    }
-                    None => {
-                        info!(
-                            "Table {}.{}.{} does not exist. Creating...",
-                            child.name, parent.schema_name, parent.name
-                        );
-                        Some(format!(
-                            "CREATE TABLE {}.{}.{} SHALLOW CLONE {}.{}.{};",
-                            child.name,
-                            parent.schema_name,
-                            parent.name,
-                            parent.catalog_name,
-                            parent.schema_name,
-                            parent.name
-                        ))
-                    }
+        let table = schema.tables.get(&parent.name);
+        match table {
+            Some(table) => {
+                if parent.updated_at - table.updated_at > self.max_staleness_duration_hours {
+                    info!("Table {} is stale. Recreating...", table.to_path());
+                    queries.push(format!(
+                        "CREATE OR REPLACE TABLE {} {} CLONE {};",
+                        table.to_path(),
+                        clone_type,
+                        parent.to_path()
+                    ));
+                    return queries;
                 }
             }
             None => {
-                warn!(
-                    "Schema {}.{} doesn't exist. Skipping...",
-                    child.name, parent.schema_name
+                info!(
+                    "Table {}.{}.{} does not exist. Creating...",
+                    child.name, parent.schema_name, parent.name
                 );
-                return None;
+                queries.push(format!(
+                    "CREATE TABLE {}.{}.{} {} CLONE {}.{}.{};",
+                    child.name,
+                    parent.schema_name,
+                    parent.name,
+                    clone_type,
+                    parent.catalog_name,
+                    parent.schema_name,
+                    parent.name
+                ));
             }
         }
+        return queries;
     }
 
     pub fn generate_queries(&self, uc: &UnityCatalog, syncs: Vec<SyncEntry>) -> Vec<String> {
@@ -95,9 +110,8 @@ impl QueryGen {
                         let pinned_catalog = uc.catalogs.get(p).unwrap();
                         let queries_for_pinned_catalog: Vec<String> = catalog
                             .iter_tables()
-                            .filter_map(|t| {
-                                self.generate_query_from_table_comparison(t, pinned_catalog)
-                            })
+                            .map(|t| self.generate_query_from_table_comparison(t, pinned_catalog))
+                            .flatten()
                             .collect();
                         return queries_for_pinned_catalog;
                     })

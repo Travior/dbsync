@@ -34,6 +34,9 @@ catalogs:
       - development
 generation_config:
   max_staleness_duration_hours: 24
+  deep_clone_non_managed: true
+  create_schema_if_missing: true
+
 ```
 
 #### Configuration Parameters
@@ -45,6 +48,9 @@ generation_config:
   - `pinned_catalogs`: List of target catalogs to synchronize
 - `generation_config`:
   - `max_staleness_duration_hours`: Maximum allowed time difference between source and target catalogs (in hours)
+  - `deep_clone_non_managed`: Whether to ignore or DEEP CLONE non-MANAGED tables
+  - `create_schema_if_missing`: Whether to create a missing schema
+
 
 ## Roadmap
 
