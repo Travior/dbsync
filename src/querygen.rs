@@ -1,126 +1,79 @@
-use std::collections::HashMap;
+use crate::unitycatalog::{DiffNode, Operation};
 
-use crate::schema::SyncEntry;
-use crate::unitycatalog::{Catalog, Schema, Table, UnityCatalog};
-use chrono::TimeDelta;
-use log::{info, warn};
-use serde::{self, Deserialize, Deserializer};
-
-fn hour_to_duration<'de, D>(deserializer: D) -> Result<chrono::TimeDelta, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let hours: i64 = Deserialize::deserialize(deserializer)?;
-    Ok(TimeDelta::seconds(hours * 3600))
+pub struct Query {
+    pub query: Option<String>,
+    pub is_fast: bool,
+    pub children: Vec<Query>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct QueryGen {
-    #[serde(deserialize_with = "hour_to_duration")]
-    max_staleness_duration_hours: TimeDelta,
-    deep_clone_non_managed: bool,
-    create_schema_if_missing: bool,
-}
-
-impl QueryGen {
-    fn generate_query_from_table_comparison(&self, parent: &Table, child: &Catalog) -> Vec<String> {
-        let mut queries = Vec::<String>::new();
-
-        if !child.schemas.contains_key(&parent.schema_name) {
-            if self.create_schema_if_missing {
-                queries.push(format!(
-                    "CREATE SCHEMA {}.{};",
-                    child.name, parent.schema_name
-                ));
-            } else {
-                warn!(
-                    "Schema {}.{} does not exist in child catalog. Skipping...",
-                    child.name, parent.schema_name
-                );
-                return queries;
-            }
-        }
-        let binding = Schema {
-            _name: parent.schema_name.to_string(),
-            tables: HashMap::new(),
-        };
-        let schema = child.schemas.get(&parent.schema_name).unwrap_or(&binding);
-
-        let mut clone_type: String = "SHALLOW".to_string();
-        match parent {
-            &Table { ref table_type, .. }
-                if table_type != "MANAGED" && self.deep_clone_non_managed =>
-            {
-                clone_type = String::from("DEEP")
-            }
-            &Table {
-                ref data_source_format,
-                ..
-            } if data_source_format.as_ref().is_none_or(|f| f != "DELTA")
-                && self.deep_clone_non_managed =>
-            {
-                clone_type = String::from("DEEP")
-            }
-            _ => {}
-        }
-
-        let table = schema.tables.get(&parent.name);
-        match table {
-            Some(table) => {
-                if parent.updated_at - table.updated_at > self.max_staleness_duration_hours {
-                    info!("Table {} is stale. Recreating...", table.to_path());
-                    queries.push(format!(
-                        "CREATE OR REPLACE TABLE {} {} CLONE {};",
-                        table.to_path(),
-                        clone_type,
-                        parent.to_path()
-                    ));
-                    return queries;
+impl Query {
+    pub fn from_diff_node(diff_node: &DiffNode, target_catalog: &str) -> Self {
+        match &diff_node.operation {
+            None => {
+                Self {
+                    query: None,
+                    is_fast: false,
+                    children: diff_node.children.iter().map(|child| Self::from_diff_node(child, target_catalog)).collect(),
                 }
             }
-            None => {
-                info!(
-                    "Table {}.{}.{} does not exist. Creating...",
-                    child.name, parent.schema_name, parent.name
-                );
-                queries.push(format!(
-                    "CREATE TABLE {}.{}.{} {} CLONE {}.{}.{};",
-                    child.name,
-                    parent.schema_name,
-                    parent.name,
-                    clone_type,
-                    parent.catalog_name,
-                    parent.schema_name,
-                    parent.name
-                ));
+            Some(operation) => {
+                match operation {
+                    Operation::CreateCatalog(_catalog) => {
+                        Self {
+                            query: Some(format!("CREATE CATALOG {}", target_catalog)),
+                            is_fast: true,
+                            children: diff_node.children.iter().map(|child| Self::from_diff_node(child, target_catalog)).collect(),
+                        }
+                    }
+                    Operation::CreateSchema(schema) => {
+                        Self {
+                            query: Some(format!("CREATE SCHEMA {}.{}", target_catalog, schema._name)),
+                            is_fast: true,
+                            children: diff_node.children.iter().map(|child| Self::from_diff_node(child, target_catalog)).collect(),
+                        }
+                    }
+                    Operation::DropCatalog(catalog) => {
+                        Self {
+                            query: Some(format!("DROP CATALOG {} CASCADE", catalog.name)),
+                            is_fast: true,
+                            children: vec![], // no children because delete gets cascaded
+                        }
+                    }
+                    Operation::DropSchema(schema) => {
+                        Self {
+                            query: Some(format!("DROP SCHEMA {}.{} CASCADE", target_catalog, schema._name)),
+                            is_fast: true,
+                            children: vec![], // no children because delete gets cascaded
+                        }
+                    }
+                    Operation::DropTable(table) => {
+                        Self {
+                            query: Some(format!("DROP TABLE {}.{}.{}", target_catalog, table.schema_name, table.name)),
+                            is_fast: true,
+                            children: vec![], // no children because delete table is always leaf node
+                        }
+                    }
+                    Operation::CloneTable { source, target } => {
+                        let mut queries = vec![];
+                        
+                        // If there's an existing table to replace, drop it first
+                        if let Some(existing_table) = target {
+                            queries.push(format!("DROP TABLE {}.{}.{}", target_catalog, existing_table.schema_name, existing_table.name));
+                        }
+                        
+                        // Create the clone
+                        queries.push(format!("CREATE TABLE {}.{}.{} SHALLOW CLONE {}.{}.{}", 
+                            target_catalog, source.schema_name, source.name, 
+                            source.catalog_name, source.schema_name, source.name));
+                        
+                        Self {
+                            query: Some(queries.join(";\n")),
+                            is_fast: true,
+                            children: vec![],
+                        }
+                    }
+                }
             }
         }
-        return queries;
-    }
-
-    pub fn generate_queries(&self, uc: &UnityCatalog, syncs: Vec<SyncEntry>) -> Vec<String> {
-        let queries: Vec<String> = syncs
-            .iter()
-            .map(|s| {
-                let catalog = uc.catalogs.get(&s.catalog).unwrap();
-                let queries_for_catalog: Vec<String> = s
-                    .pinned_catalogs
-                    .iter()
-                    .map(|p| {
-                        let pinned_catalog = uc.catalogs.get(p).unwrap();
-                        let queries_for_pinned_catalog: Vec<String> = catalog
-                            .iter_tables()
-                            .map(|t| self.generate_query_from_table_comparison(t, pinned_catalog))
-                            .flatten()
-                            .collect();
-                        return queries_for_pinned_catalog;
-                    })
-                    .flatten()
-                    .collect();
-                return queries_for_catalog;
-            })
-            .flatten()
-            .collect();
-        return queries;
     }
 }

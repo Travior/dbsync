@@ -1,4 +1,3 @@
-use crate::querygen::QueryGen;
 use serde::Deserialize;
 use serde_yaml::from_str;
 use std::fs;
@@ -14,7 +13,6 @@ pub struct SyncConfig {
     pub catalogs: Vec<SyncEntry>,
     pub host: String,
     pub pat: String,
-    pub generation_config: QueryGen,
 }
 
 pub fn load_config(path: &str) -> Result<SyncConfig, Box<dyn std::error::Error>> {

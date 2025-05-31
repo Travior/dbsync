@@ -1,16 +1,30 @@
-use log::info;
+use anyhow::Result;
 use reqwest_middleware::{
     reqwest::{self},
     ClientBuilder, ClientWithMiddleware,
 };
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+
+#[derive(Debug, Deserialize)]
+pub struct Catalog {
+    pub name: String,
+}
+
+
 #[derive(Deserialize, Debug)]
+pub struct GetCatalogResponse {
+    pub catalogs: Vec<Catalog>,
+}
+
+
+#[derive(Debug, Deserialize)]
 pub struct Schema {
     pub name: String,
+    pub catalog_name: String,
 }
 #[derive(Deserialize, Debug)]
 pub struct GetSchemaResponse {
@@ -34,13 +48,15 @@ pub struct GetTableResponse {
     tables: Option<Vec<Table>>,
 }
 
-pub struct APIClient {
+
+#[derive(Clone)]
+pub struct Client {
     host: String,
     client: ClientWithMiddleware,
     pat: String,
 }
 
-impl APIClient {
+impl Client {
     pub fn new(host: &str, pat: &str) -> Self {
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
         let client = ClientBuilder::new(reqwest::Client::new())
@@ -53,14 +69,9 @@ impl APIClient {
             pat: pat.to_string(),
         }
     }
-
-    async fn paginate_request<T>(
-        &self,
-        endpoint: &str,
-        query: &[(&str, &str)],
-    ) -> Result<Vec<T>, Box<dyn std::error::Error>>
+    async fn get<T>(&self, endpoint: &str, query: &[(&str, &str)]) -> Result<Vec<T>>
     where
-        T: for<'de> Deserialize<'de>,
+        T: DeserializeOwned,
     {
         let mut data: Vec<T> = Vec::new();
         let mut next_page: Option<String> = None;
@@ -88,38 +99,55 @@ impl APIClient {
         }
         Ok(data)
     }
+}
 
-    pub async fn collect_schemas(
-        &self,
-        catalog: &str,
-    ) -> Result<Vec<Schema>, Box<dyn std::error::Error>> {
-        info!("Fetching schemas for path {}", catalog);
-        let data: Vec<GetSchemaResponse> = self
-            .paginate_request(
-                "api/2.1/unity-catalog/schemas",
-                &[("catalog_name", catalog)],
-            )
-            .await?;
-        Ok(data.into_iter().map(|i| i.schemas).flatten().collect())
-    }
+pub struct FetchAllCatalogs {}
 
-    pub async fn collect_tables(
-        &self,
-        catalog: &str,
-        schema: &str,
-    ) -> Result<Vec<Table>, Box<dyn std::error::Error>> {
-        info!("Fetching tables for path {}.{}", catalog, schema);
-        let data: Vec<GetTableResponse> = self
-            .paginate_request(
-                "api/2.1/unity-catalog/tables",
-                &[("catalog_name", catalog), ("schema_name", schema)],
-            )
-            .await?;
+pub struct FetchCatalog {
+    pub catalog_name: String,
+}
 
-        Ok(data
-            .into_iter()
-            .map(|i| i.tables.unwrap_or_default())
-            .flatten()
-            .collect())
+pub struct FetchSchema {
+    pub catalog_name: String,
+    pub schema_name: String,
+}
+
+
+pub enum FetchJob {
+    FetchAllCatalogs(FetchAllCatalogs),
+    FetchCatalog(FetchCatalog),
+    FetchSchema(FetchSchema),
+}
+
+impl FetchAllCatalogs {
+    pub async fn get_children(self, client: &Client) -> Result<Vec<Catalog>> {
+        let catalogs = client
+            .get::<GetCatalogResponse>("api/2.1/unity-catalog/catalogs", &[]).await?;
+        Ok(catalogs.into_iter().map(|c| c.catalogs).flatten().collect())
     }
 }
+
+impl FetchCatalog {
+    pub async fn get_children(&self, client: &Client) -> Result<Vec<Schema>> {
+        let schemas = client
+            .get::<GetSchemaResponse>(
+                "api/2.1/unity-catalog/schemas",
+                &[("catalog_name", &self.catalog_name)],
+            )
+            .await?;
+        Ok(schemas.into_iter().map(|s| s.schemas).flatten().collect())
+    }
+}
+
+impl FetchSchema {
+    pub async fn get_children(&self, client: &Client) -> Result<Vec<Table>> {
+        let tables = client
+            .get::<GetTableResponse>(
+                "api/2.1/unity-catalog/tables",
+                &[("catalog_name", &self.catalog_name), ("schema_name", &self.schema_name)],
+            )
+            .await?;
+        Ok(tables.into_iter().map(|t| t.tables.unwrap_or_default()).flatten().collect())
+    }
+}
+
